@@ -1,0 +1,132 @@
+name: Criar APK
+
+# Corre sempre que mandas ficheiros para o GitHub,
+# e também quando carregas no botão "Run workflow".
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'www/**'
+      - 'package.json'
+      - 'capacitor.config.json'
+      - '.github/workflows/apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # necessário para publicar a Release
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----------------------------------------------------------------
+      # A versão vem do próprio ficheiro da app, da primeira entrada do
+      # registo de alterações. Assim nunca ficam dessincronizadas, e o
+      # "Verificar atualizações" dentro da app encontra sempre a release.
+      # ----------------------------------------------------------------
+      - name: Ler a versão da app
+        id: ver
+        run: |
+          V=$(grep -o "v:'[0-9][0-9.]*'" www/index.html | head -1 | grep -o "[0-9][0-9.]*")
+          if [ -z "$V" ]; then echo "Não encontrei a versão em www/index.html"; exit 1; fi
+          echo "versao=$V" >> $GITHUB_OUTPUT
+          echo "Versão encontrada: $V"
+
+      - name: Já existe uma release desta versão?
+        id: existe
+        run: |
+          if gh release view "v${{ steps.ver.outputs.versao }}" >/dev/null 2>&1; then
+            echo "repetida=sim" >> $GITHUB_OUTPUT
+            echo "Já existe a release v${{ steps.ver.outputs.versao }} — vai ser substituída."
+          else
+            echo "repetida=nao" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Instalar dependências
+        run: npm install
+
+      # ----------------------------------------------------------------
+      # Sem isto, cada compilação assinaria o APK com uma chave diferente
+      # e o Android recusava-se a instalar a atualização por cima.
+      # O segredo DEBUG_KEYSTORE_B64 fixa a chave entre compilações.
+      # Se não estiver definido, o APK sai na mesma, mas para atualizar
+      # tens de desinstalar a app primeiro.
+      # ----------------------------------------------------------------
+      - name: Repor a chave de assinatura
+        id: chave
+        run: |
+          mkdir -p ~/.android
+          if [ -n "${{ secrets.DEBUG_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d > ~/.android/debug.keystore
+            echo "Chave reposta a partir do segredo."
+            echo "fixa=sim" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Sem DEBUG_KEYSTORE_B64. O APK vai ser assinado com uma chave nova e só instala depois de desinstalares a versão anterior."
+            echo "fixa=nao" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Criar o projeto Android
+        env:
+          CI: 'true'          # impede o Capacitor de parar a perguntar pela telemetria
+        run: npx cap add android || npx cap sync android
+
+      - name: Ícone da app
+        continue-on-error: true    # se falhar, fica o ícone de origem; não vale parar a compilação por isso
+        run: |
+          mkdir -p resources
+          npx @capacitor/assets generate --android --iconBackgroundColor '#123c38' --iconBackgroundColorDark '#123c38'
+
+      - name: Pôr a versão no Android
+        run: |
+          V="${{ steps.ver.outputs.versao }}"
+          sed -i "s/versionName \".*\"/versionName \"$V\"/" android/app/build.gradle
+          sed -i "s/versionCode [0-9]*/versionCode ${{ github.run_number }}/" android/app/build.gradle
+          grep -E "versionCode|versionName" android/app/build.gradle
+
+      - name: Compilar o APK
+        run: |
+          chmod +x android/gradlew
+          cd android && ./gradlew assembleDebug --no-daemon
+
+      - name: Dar nome ao ficheiro
+        run: |
+          mkdir -p saida
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+             "saida/receitas-${{ steps.ver.outputs.versao }}.apk"
+          ls -lh saida/
+
+      # Fica disponível em Actions, mesmo que a Release falhe
+      - name: Guardar o APK em Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: receitas-${{ steps.ver.outputs.versao }}
+          path: saida/*.apk
+
+      # É daqui que a app lê o "Verificar atualizações"
+      - name: Publicar a Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.versao }}
+          name: Receitas ${{ steps.ver.outputs.versao }}
+          files: saida/*.apk
+          body: |
+            APK da versão ${{ steps.ver.outputs.versao }}.
+
+            Descarrega o ficheiro abaixo e abre-o no telemóvel para instalar.
+            ${{ steps.chave.outputs.fixa == 'nao' && '⚠️ Esta versão foi assinada com uma chave nova: desinstala a app antiga antes de instalar esta.' || 'Instala por cima da versão anterior, sem desinstalar.' }}
+
+            O que mudou está em Definições → Registo de alterações.
